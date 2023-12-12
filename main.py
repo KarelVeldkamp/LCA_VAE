@@ -5,12 +5,16 @@ import yaml
 from pytorch_lightning import Trainer
 from pytorch_lightning.callbacks.early_stopping import EarlyStopping
 from pytorch_lightning.loggers import CSVLogger
+from scipy.optimize import linear_sum_assignment
 import pandas as pd
 import matplotlib.pyplot as plt
 import numpy as np
 from data import *
 from scipy.stats import pearsonr
 
+#if len(sys.argv) > 1:
+#    cfg['nclass'] = int(sys.argv[1])
+#    cfg['temperature_decay'] = float(sys.argv[2])
 
 def MSE(est, true):
     """
@@ -26,17 +30,6 @@ def MSE(est, true):
     """
     return np.mean(np.power(est-true,2))
 
-def Cor(A, B):
-    # Rowwise mean of input arrays & subtract from input arrays themeselves
-    A_mA = A - A.mean(1)[:, None]
-    B_mB = B - B.mean(1)[:, None]
-
-    # Sum of squares across rows
-    ssA = (A_mA**2).sum(1)
-    ssB = (B_mB**2).sum(1)
-
-    # Finally get corr coeff
-    return np.dot(A_mA, B_mB.T) / np.sqrt(np.dot(ssA[:, None],ssB[None]))
 
 def Cor(x, y):
     """Correlate each n with each m.
@@ -78,79 +71,119 @@ logger = CSVLogger("logs", name=cfg['which_data'], version=0)
 trainer = Trainer(fast_dev_run=cfg['single_epoch_test_run'],
                   max_epochs=cfg['max_epochs'],
                   logger=logger,
-                  callbacks=[EarlyStopping(monitor='train_loss', min_delta=cfg['min_delta'], patience=cfg['patience'], mode='min')])
+                  callbacks=[
+                      EarlyStopping(monitor='train_loss', min_delta=cfg['min_delta'], patience=cfg['patience'],
+                                    mode='min')])
 
-dataset = CSVDataset('data/data.csv')
+# dataset = CSVDataset('data/data.csv')
+# train_loader = DataLoader(dataset, batch_size=cfg['batch_size'], shuffle=False)
+# Number of classes, items, and people
+nclass = cfg['nclass']
+nitems = cfg['nitems']
+N = cfg['N']
+
+# Generate class probabilities
+class_probs = np.ones(nclass) / nclass
+
+# Generate conditional probabilities
+cond_probs = np.random.uniform(0.1, 0.9, size=(nclass, nitems))
+
+# Generate true class membership for each person
+true_class_ix = np.random.choice(np.arange(nclass), size=(N,), p=class_probs)
+true_class = np.zeros((N, nclass))
+true_class[np.arange(N), true_class_ix] = 1
+
+# simulate responses
+prob = true_class @ cond_probs
+data = np.random.binomial(1, prob).astype(float)
+
+# create pytorch dataset
+dataset = MemoryDataset(data)
 train_loader = DataLoader(dataset, batch_size=cfg['batch_size'], shuffle=False)
-vae = VAE(dataloader=train_loader,
-          nitems=cfg['nitems'],
-          learning_rate=cfg['learning_rate'],
-          latent_dims=cfg['nclass'],
-          hidden_layer_size=50,
-          qm=None,
-          batch_size=5000,
-          beta=1)
-trainer.fit(vae)
+test_loader = DataLoader(dataset, batch_size=cfg['N'], shuffle=False)
 
+if cfg['model'] == 'vq':
+    # initiate model
+    model = VQVAE(dataloader=train_loader,
+              nitems=cfg['nitems'],
+              learning_rate=cfg['learning_rate'],
+              latent_dims=cfg['nclass'],
+              hidden_layer_size=50,
+              emb_dim=10,
+              beta=1)
+elif cfg['model'] == 'gs':
+    model = GSVAE(dataloader=train_loader,
+                nitems=cfg['nitems'],
+                learning_rate=cfg['learning_rate'],
+                latent_dims = cfg['nclass'],
+                hidden_layer_size=50,
+                beta=1,
+                temperature=cfg['temperature'],
+                temperature_decay=cfg['temperature_decay'])
+elif cfg['model'] == 'rbm':
+    model = RestrictedBoltzmannMachine(
+        dataloader=train_loader,
+        n_visible=cfg['nitems'],
+        n_hidden=cfg['nclass'],
+        learning_rate=cfg['learning_date'],
+        n_gibbs=cfg['gibbs_samples']
+    )
+else:
+    raise ValueError('Invalid model type')
 
-true_class = torch.squeeze(torch.Tensor(pd.read_csv('./data/true_class.csv', index_col=0).values))
-# calculate predicted class labels
-data = next(iter(train_loader))
-log_p = vae.encoder(data)
-cl = torch.argmax(log_p, dim=1)
-acc = torch.mean((cl== true_class).float())
+trainer.fit(model)
 
+test_data = next(iter(test_loader))
+if cfg['model'] == 'gs':
+    log_pi = model.encoder(test_data)
+    pred_class = model.GumbelSoftmax(log_pi).detach().numpy()
+    pred_class_ix = np.argmax(pred_class, 1)
 
-print(f'Latent class accuracy: {acc.item():.4f}')
+    # get the conditional probabilities
+    est_probs = model.decoder(torch.eye(cfg['nclass'])).detach().numpy()
 
-#est_class = F.one_hot(cl, num_classes=2)
+elif cfg['model'] == 'vq':
+    ze = model.encoder(test_data)
+    _, pred_class_ix, _ = model.VQSampler(ze)
+    pred_class_ix = pred_class_ix.detach().numpy()
 
-data = next(iter(train_loader))
-pred = vae(data)
+    embs = model.VQSampler.embeddings.weight
+    est_probs = model.decoder(embs).detach().numpy()
+elif cfg['model'] == 'rbm':
+    _, pred_class = model.sample_h(test_data).detach().numpy()
+    pred_class_ix = np.argmax(pred_class, 1)
 
-#print(pred)
-#print(data)
-mse = MSE(pred.detach().numpy(), data.detach().numpy())
-print(f'MSE(pred, data): {mse:.4f}')
-
-#print(torch.mean(cl))
-
-#z = vae.GumbelSoftmax(log_p)
-
-# out = vae.decoder(z)
-# dist = torch.distributions.binomial.Binomial(probs=out)
-# for i in range(10):
-#     sample = dist.sample()
-#     bce = torch.nn.functional.binary_cross_entropy(out, sample, reduction='none')
-#     bce = torch.mean(bce) * 10
-#     print(bce)
-
-
-# get the conditional probabilities for class 1 and class 2
-probs = 1-vae.decoder(torch.eye(cfg['nclass'])).detach().numpy()
+    est_probs =
 
 # plot training loss
 logs = pd.read_csv(f'logs/{cfg["which_data"]}/version_0/metrics.csv')
 plt.plot(logs['epoch'], logs['train_loss'])
 plt.title('Training loss')
 plt.savefig(f'./figures/{cfg["which_data"]}/training_loss.png')
-true_probs = pd.read_csv('data/true_probs.csv', index_col=0).to_numpy()
+# true_probs = pd.read_csv('data/true_probs.csv', index_col=0).to_numpy()
 
 # match estimated latent classes to the correct true class
-new_order = np.argmax(Cor(probs, true_probs),0)
-probs = probs[new_order, :]
-print(new_order)
-# flatten probs for plotting
-true_probs = true_probs.flatten()
-est_probs = probs.flatten()
 
+_, new_order = linear_sum_assignment(-Cor(est_probs, cond_probs))
+cond_probs = cond_probs[new_order, :]
+true_class = true_class[:, new_order]
+true_class_ix = np.argmax(true_class, 1)
+
+# flatten probs for plotting
+true_probs = cond_probs.flatten()
+est_probs = est_probs.flatten()
 
 plt.figure()
 mse = MSE(est_probs, true_probs)
 plt.scatter(y=est_probs, x=true_probs)
 plt.plot(true_probs, true_probs)
-plt.title(f'Probability estimation plot:, MSE={round(mse,4)}')
+plt.title(f'Probability estimation plot:, MSE={round(mse, 4)}')
 plt.xlabel('True values')
 plt.ylabel('Estimates')
 plt.savefig(f'./figures/{cfg["which_data"]}/probabilities.png')
+
+# print latent class accuracy
+print(f'class accuracy: {np.mean(pred_class_ix == true_class_ix)}')
+
+
 

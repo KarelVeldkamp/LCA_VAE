@@ -1,3 +1,7 @@
 data/*
 figures/*
 logs/*
+results/*
+lightning_logs/**
+
+*.ipynb

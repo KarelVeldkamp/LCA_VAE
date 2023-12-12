@@ -3,6 +3,7 @@
   <component name="ProjectModuleManager">
     <modules>
       <module fileurl="file://$PROJECT_DIR$/.idea/LCA_VAE.iml" filepath="$PROJECT_DIR$/.idea/LCA_VAE.iml" />
+      <module fileurl="file://$PROJECT_DIR$/../MIRT-VAE-QMAtrix/.idea/MIRT-VAE-QMAtrix.iml" filepath="$PROJECT_DIR$/../MIRT-VAE-QMAtrix/.idea/MIRT-VAE-QMAtrix.iml" />
     </modules>
   </component>
 </project>
