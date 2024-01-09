@@ -301,11 +301,9 @@ class GSVAE(pl.LightningModule):
         """
 
         log_pi = self.encoder(x)
-        z = self.GumbelSoftmax(log_pi)
+        #z = self.GumbelSoftmax(log_pi)
+        z = self.ST(log_pi.exp())
 
-        # commented out raouls idee
-        #z = self.Softmax(log_pi)
-        #z = self.mns(z)
 
         reco = self.decoder(z)
 
@@ -429,7 +427,7 @@ class RestrictedBoltzmannMachine(pl.LightningModule):
         self.n_gibbs = n_gibbs
 
         self.dataloader = dataloader
-        self.automatic_optimization = False
+        #self.automatic_optimization = False
 
     def sample_h(self, v):
         ph = torch.sigmoid(torch.matmul(v, self.W) + self.b_hidden)
@@ -452,13 +450,17 @@ class RestrictedBoltzmannMachine(pl.LightningModule):
     def training_step(self, v0):
         v = v0.detach().clone()
         for i in range(self.n_gibbs):
-            h, ph = self.sample_hidden(v)
-            v = self.sample_v(h)
+            h, ph = self.sample_h(v)
+            v, pv = self.sample_v(h)
 
         loss = self.free_energy(v0) - self.free_energy(v)
 
-        return loss
+        self.log('train_loss', loss)
+        return {'loss': loss}
 
 
     def train_dataloader(self):
         return self.dataloader
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.lr, amsgrad=True)

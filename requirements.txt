@@ -2,3 +2,4 @@ torch
 pytorch_lightning
 pandas
 matplotlib
+scipy
