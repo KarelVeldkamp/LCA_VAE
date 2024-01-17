@@ -37,6 +37,29 @@ class GumbelSoftmax(pl.LightningModule):
         return y
 
 
+class SpikeAndExp(pl.LightningModule):
+    """
+    Spike-and-exponential smoother from the original DVAE paper of Rolfe.
+    """
+    def __init__(self, beta):
+        super(SpikeAndExp, self).__init__()
+        self.beta = torch.Tensor([beta]).float()
+
+    def forward(self, q):
+        #clip the probabilities
+        q = torch.clamp(q,min=1e-7,max=1.-1e-7)
+
+        #this is a tensor of uniformly sampled random number in [0,1)
+        rho = torch.rand(q.size())
+        zero_mask = torch.zeros(q.size())
+        ones = torch.ones(q.size())
+
+        # inverse CDF
+        conditional_log = (1./self.beta)*torch.log(((rho+q-ones)/q)*(self.beta.exp()-1)+ones)
+
+        zeta=torch.where(rho >= 1 - q, conditional_log, zero_mask)
+        return zeta
+
 class STEFunction(torch.autograd.Function):
     """
     Class for straight through estimator. Samples from a tensor of proabilities, but defines gradient as if
@@ -65,6 +88,7 @@ class STEFunction(torch.autograd.Function):
         """
         return F.hardtanh(grad_output)
 
+
 class StraightThroughSampler(nn.Module):
     """
     Neural network module for straight though sampler. Samples a value in forward but returns gradients as
@@ -77,10 +101,10 @@ class StraightThroughSampler(nn.Module):
             x = STEFunction.apply(x)
             return x
 
+
 class MultinomialSampler(nn.Module):
     """
-    Neural network module for straight though sampler. Samples a value in forward but returns gradients as
-    if there was no sampling
+    Neural network module for multinomial sampler.
     """
     def __init__(self):
         super(MultinomialSampler, self).__init__()
@@ -136,12 +160,12 @@ class VectorQuantizeSampler(nn.Module):
             x = VQFunction.apply(zq, embeddings)
             return x
 
+
 class VectorQuantizer(nn.Module):
     def __init__(self, n_emb, emb_dim):
         super().__init__()
 
         self.embeddings = nn.Embedding(n_emb, emb_dim)
-
 
     def forward(self, ze):
         # compute the distances between the encoder outputs and the embeddings
@@ -254,6 +278,7 @@ class VQDecoder(pl.LightningModule):
         out = self.activation(out)
         return out
 
+
 class GSVAE(pl.LightningModule):
     """
     Neural network for the entire variational autoencoder
@@ -266,7 +291,8 @@ class GSVAE(pl.LightningModule):
                  learning_rate: float,
                  beta: int = 1,
                  temperature: float = 10,
-                 temperature_decay: float = .998):
+                 temperature_decay: float = .998,
+                 n_iw_samples: int = 1):
         """
         Initialisaiton
         :param latent_dims: number of latent dimensions
@@ -281,9 +307,9 @@ class GSVAE(pl.LightningModule):
                                latent_dims,
                                hidden_layer_size
         )
-        self.mns = MultinomialSampler()
+
         self.GumbelSoftmax = GumbelSoftmax(temperature, temperature_decay)
-        self.ST = StraightThroughSampler()
+        #self.ST = StraightThroughSampler()
         self.Softmax = nn.Softmax(dim=1)
 
         self.decoder = Decoder(nitems, latent_dims)
@@ -291,6 +317,7 @@ class GSVAE(pl.LightningModule):
         self.lr = learning_rate
         self.beta = beta
         self.kl=0
+        self.n_iw_samples = n_iw_samples
 
     def forward(self, x: torch.Tensor, m: torch.Tensor=None):
         """
@@ -301,8 +328,8 @@ class GSVAE(pl.LightningModule):
         """
 
         log_pi = self.encoder(x)
-        #z = self.GumbelSoftmax(log_pi)
-        z = self.ST(log_pi.exp())
+        z = self.GumbelSoftmax(log_pi)
+        #z = self.ST(log_pi.exp())
 
 
         reco = self.decoder(z)
@@ -310,11 +337,11 @@ class GSVAE(pl.LightningModule):
         # Calcualte the estimated probabilities
         pi = self.Softmax(log_pi)
         # calculate kl divergence
-        #self.kl = -torch.sum(pi * torch.log(pi))
+
         log_ratio = torch.log(pi * 2 + 1e-20)
         self.kl = torch.sum(pi * log_ratio, dim=-1).mean()
 
-        return reco
+        return reco, log_pi, z
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.lr, amsgrad=True)
@@ -323,12 +350,12 @@ class GSVAE(pl.LightningModule):
         # forward pass
 
         data = batch
-        X_hat = self(data)
+        X_hat, log_pi, z = self(data)
 
         bce = torch.nn.functional.binary_cross_entropy(X_hat, batch, reduction='none')
         bce = torch.mean(bce) * self.nitems
-
         loss = bce + self.beta * torch.sum(self.kl)
+
         self.GumbelSoftmax.temperature *= self.GumbelSoftmax.temperature_decay
         self.log('train_loss',loss)
 
@@ -336,6 +363,8 @@ class GSVAE(pl.LightningModule):
 
     def train_dataloader(self):
         return self.dataloader
+
+
 
 class VQVAE(pl.LightningModule):
     """
@@ -413,6 +442,83 @@ class VQVAE(pl.LightningModule):
         return self.dataloader
 
 
+class DiscreteVAE(pl.LightningModule):
+    """
+    Neural network for the entire variational autoencoder
+    """
+    def __init__(self,
+                 dataloader,
+                 nitems: int,
+                 latent_dims: int,
+                 hidden_layer_size: int,
+                 learning_rate: float,
+                 beta: int = 1):
+        """
+        Initialisaiton
+        :param latent_dims: number of latent dimensions
+        :param qm: IxD Q-matrix specifying which items i<I load on which dimensions d<D
+        """
+        super(DiscreteVAE, self).__init__()
+        #self.automatic_optimization = False
+        self.nitems = nitems
+        self.dataloader = dataloader
+
+        self.encoder = Encoder(nitems,
+                               latent_dims,
+                               hidden_layer_size
+        )
+
+        self.SaE = SpikeAndExp(beta=1)
+        self.Softmax = nn.Softmax(dim=1)
+
+        self.decoder = Decoder(nitems, latent_dims)
+
+        self.lr = learning_rate
+        self.beta = beta
+        self.kl=0
+
+    def forward(self, x: torch.Tensor, m: torch.Tensor=None):
+        """
+        forward pass though the entire network
+        :param x: tensor representing response data
+        :param m: mask representing which data is missing
+        :return: tensor representing a reconstruction of the input response data
+        """
+
+        log_pi = self.encoder(x)
+        zeta = self.SaE(log_pi.exp())
+        reco = self.decoder(zeta)
+
+        # Calculate the estimated probabilities
+        pi = self.Softmax(log_pi)
+        # calculate kl divergence
+        log_ratio = torch.log(pi * 2 + 1e-20)
+        self.kl = torch.sum(pi * log_ratio, dim=-1).mean()
+
+        return reco
+
+    def configure_optimizers(self):
+        return torch.optim.Adam(self.parameters(), lr=self.lr, amsgrad=True)
+
+    def training_step(self, batch, batch_idx):
+        # forward pass
+
+        data = batch
+        X_hat = self(data)
+        bce = torch.nn.functional.binary_cross_entropy(X_hat, batch, reduction='none')
+        bce = torch.mean(bce) * self.nitems
+
+        loss = bce + self.beta * torch.sum(self.kl)
+        self.log('train_loss',loss)
+
+        return {'loss': loss}
+
+    def train_dataloader(self):
+        return self.dataloader
+
+
+
+
 class RestrictedBoltzmannMachine(pl.LightningModule):
 
     def __init__(self, dataloader, n_visible, n_hidden, learning_rate, n_gibbs):
@@ -421,6 +527,8 @@ class RestrictedBoltzmannMachine(pl.LightningModule):
         self.W = torch.nn.Parameter(torch.randn(n_visible, n_hidden))
         self.b_hidden = torch.nn.Parameter(torch.zeros(n_hidden))
         self.b_visible = torch.nn.Parameter(torch.zeros(n_visible))
+
+        self.nitems = n_visible
 
         # hyperparamters
         self.lr = learning_rate
