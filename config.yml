@@ -1,5 +1,5 @@
 configs:
-  # general optimization parameters:
+  # general optimization true:
   batch_size: 64
   gibbs_samples: 1
   max_epochs: 1000
@@ -9,10 +9,11 @@ configs:
   temperature: 1
   temperature_decay: .9999
   single_epoch_test_run: False
-  which_data: 'sim' # R or sim
-  nclass: 4
-  n_rep: 5 # number of times to fit the model with different starting values
+  which_data: 'disk' # disk or sim
+  save_data: False
+  nclass: 2
+  n_rep: 1 # number of times to fit the model with different starting values
   n_iw_samples: 1
   N: 1000
   nitems: 20
-  model: 'dvae' #gs, vq, dvae or rbm
+  model: 'gs' #st, gs, vq, dvae or rbm

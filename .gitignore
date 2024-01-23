@@ -1,7 +1,7 @@
-data/*
-figures/*
-logs/*
-results/*
+figures/**
+logs/**
+results/**
+true/**
 lightning_logs/**
 
 *.ipynb
