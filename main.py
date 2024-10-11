@@ -12,6 +12,7 @@ import numpy as np
 from numpy import genfromtxt
 import os
 import sys
+import time
 
 # read in configurations
 with open("./config.yml", "r") as f:
@@ -21,9 +22,10 @@ with open("./config.yml", "r") as f:
 # potentially overwrite configurations with command line arguments
 if len(sys.argv) > 1:
     cfg['model'] = sys.argv[1]
-    cfg['nclass'] = int(sys.argv[2])
-    cfg['n_rep'] = int(sys.argv[3])
-    iteration = sys.argv[4]
+    cfg['learning_rate'] = float(sys.argv[2])
+    cfg['temperature_decay'] = float(sys.argv[3])
+    iteration = int(sys.argv[4])
+    cfg['n_rep'] = int(sys.argv[5])
 else:
     iteration = 1
 
@@ -34,11 +36,22 @@ if cfg['which_data'] == 'sim':
     N = cfg['N']
 
     # Generate class probabilities
-    np.random.seed(1)
+    np.random.seed(iteration)
     class_probs = np.ones(nclass) / nclass
 
     # Generate conditional probabilities
-    cond_probs = np.random.uniform(0.1, 0.9, size=(nclass, nitems))
+   # cond_probs = np.random.uniform(.4, .5, size=(nclass, nitems))
+    cond_probs = np.expand_dims(np.random.uniform(.3, .7, nitems), 0).repeat(nclass, 0)
+    # Iterate over each row
+    for i in range(nclass):
+        # Randomly choose the number of entries to set to one between 50 and 100
+        num_ones = int(nitems * 0.15) #np.random.randint(50, 80)
+
+        # Randomly select num_ones indices to set to one
+        indices = np.random.choice(nitems, num_ones, replace=False)
+
+        # Set the selected indices to one
+        cond_probs[i, indices] += .20#np.random.uniform(.1,.25, num_ones)
 
     # Generate true class membership for each person
     true_class_ix = np.random.choice(np.arange(nclass), size=(N,), p=class_probs)
@@ -48,6 +61,7 @@ if cfg['which_data'] == 'sim':
     # simulate responses
     prob = true_class @ cond_probs
     data = np.random.binomial(1, prob).astype(float)
+
 
     if cfg['save_data']:
         np.savetxt(f'true/data/data_{cfg["nclass"]}_{iteration}.csv', data,  delimiter=',')
@@ -59,7 +73,6 @@ elif cfg['which_data'] == 'disk':
     cond_probs = genfromtxt(f'true/parameters/probs_{cfg["nclass"]}_{iteration}.csv', delimiter=',')
     true_class = genfromtxt(f'true/parameters/class_{cfg["nclass"]}_{iteration}.csv', delimiter=',')
 
-    print(cond_probs.shape)
     true_class_ix = np.argmax(true_class, 1)
 else:
     raise ValueError('Unknown value for which_data')
@@ -73,17 +86,18 @@ test_loader = DataLoader(dataset, batch_size=cfg['N'], shuffle=False)
 # repeat process cfg['n_rep'] times to prevent local minima
 best = -float('inf')
 for i in range(cfg['n_rep']):
-    if cfg['model'] in ['dvae', 'gs', 'vq']:
+    if cfg['model'] in ['dvae', 'gs', 'vq', 'log']:
         model = VAE(dataloader=train_loader,
                     nitems=cfg['nitems'],
                     nclass=cfg['nclass'],
-                    hidden_layer_size=50,
+                    hidden_layer_size=(cfg['nitems']+cfg['nclass'])//2,
                     learning_rate=cfg['learning_rate'],
-                    emb_dim=10,
+                    emb_dim=cfg['emb_dim'],
                     beta=1,
                     temperature=cfg['temperature'],
                     temperature_decay=cfg['temperature_decay'],
-                    sampler_type=cfg['model'])
+                    sampler_type=cfg['model'],
+                    n_iw_samples=cfg['n_iw_samples'])
     elif cfg['model'] == 'rbm':
         nnodes = np.log2(cfg['nclass'])
         if not nnodes.is_integer():
@@ -105,22 +119,32 @@ for i in range(cfg['n_rep']):
     logger = CSVLogger("logs", name='all', version=0)
     trainer = Trainer(fast_dev_run=cfg['single_epoch_test_run'],
                       max_epochs=cfg['max_epochs'],
+                      #min_epochs=1000,
                       logger=logger,
                       callbacks=[
                       EarlyStopping(monitor='train_loss', min_delta=cfg['min_delta'], patience=cfg['patience'],
-                                    mode='min')])
+                                    mode='min')],
+                      enable_progress_bar=True,
+                      enable_model_summary=False,
+                      detect_anomaly=False,
+                      accelerator='cpu')
 
+    start = time.time()
     trainer.fit(model)
+    runtime = time.time() - start
+    print(f'runtime: {runtime}')
 
     # compute the estimated conditional probabilities and the posterior probabilities on the test data
     test_data = next(iter(test_loader))
-    if cfg['model'] == 'gs':
+    if cfg['model'] in ['gs', 'log']:
         log_pi = model.encoder(test_data)
         pred_class = model.sampler(log_pi.exp()).detach().numpy()
         pred_class_ix = np.argmax(pred_class, 1)
 
         # get the conditional probabilities
         est_probs = model.decoder(torch.eye(cfg['nclass'])).detach().numpy()
+
+
     elif cfg['model'] == 'dvae':
         # log
         log_pi = model.encoder(test_data)
@@ -187,18 +211,23 @@ for i in range(cfg['n_rep']):
         logs = pd.read_csv(f'logs/all/version_0/metrics.csv')
         plt.plot(logs['epoch'], logs['train_loss'])
         plt.title('Training loss')
-        plt.savefig(f'./figures/all/training_loss.png')
+        plt.savefig(f'./figures/training_loss.png')
         # true_probs = pd.read_csv('data/true_probs.csv', index_col=0).to_numpy()
+
+
 
     # Compute log likelihood
     log_likelihood = np.sum(data * np.log(pred_class.dot(est_probs) + 1e-10) +
                             (1 - data) * np.log(1 - pred_class.dot(est_probs) + 1e-10))
+
 
     # save class predictions and conditional probanilities only for the model with the highest likelihood
     if log_likelihood > best:
         best = log_likelihood
         best_class_ix = pred_class_ix
         best_cond_probs = est_probs
+        np.savetxt('./tmp/est_probs.csv', est_probs, delimiter=',')
+        np.savetxt('./tmp/pred_class.csv', pred_class, delimiter=',')
 
 # match estimated latent classes to the correct true class
 _, new_order = linear_sum_assignment(-Cor(best_cond_probs, cond_probs))
@@ -206,10 +235,12 @@ cond_probs = cond_probs[new_order, :]
 true_class = true_class[:, new_order]
 true_class_ix = np.argmax(true_class, 1)
 
+
+
 # compute latent class accuracy
 lc_acc = np.mean(best_class_ix == true_class_ix)
 # compute MSE of conditional probabilities
-mse_cond = MSE(est_probs, cond_probs)
+mse_cond = MSE(best_cond_probs, cond_probs)
 
 
 # only plot if there are no command line arguments
@@ -224,14 +255,14 @@ if len(sys.argv) == 1:
     plt.title(f'Probability estimation plot:, MSE={round(mse_cond, 4)}')
     plt.xlabel('True values')
     plt.ylabel('Estimates')
-    plt.savefig(f'./figures/all/probabilities.png')
+    plt.savefig(f'./figures/probabilities.png')
 
     # print latent class accuracy
     print(f'class accuracy: {lc_acc}')
     print(f'MSE: {mse_cond}')
 else:
     with open(f"results/metrics/{'_'.join(sys.argv[1:])}.txt", 'w') as f:
-        f.writelines([f'{lc_acc}\n', f'{mse_cond}\n'])
+        f.writelines([f'{lc_acc}\n', f'{mse_cond}\n', f'{runtime}\n'])
 
     par_names = ['conditional', 'class']
     par = []
@@ -249,5 +280,5 @@ else:
     result = pd.DataFrame({'model': cfg['model'], 'nclass': cfg['nclass'], 'n_rep': cfg['n_rep'],
                            'iteration':iteration, 'parameter': par, 'i': par_i, 'j': par_j, 'value': value})
 
-    result.to_csv(f'/results/estimates/est_{"_".join(sys.argv[1:])}.txt')
+    result.to_csv(f'results/estimates/est_{"_".join(sys.argv[1:])}.txt')
 

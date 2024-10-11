@@ -1,19 +1,20 @@
 configs:
   # general optimization true:
-  batch_size: 64
+  batch_size: 1000
   gibbs_samples: 1
-  max_epochs: 1000
-  learning_rate: .0005
-  min_delta: .00000008
-  patience: 100
+  max_epochs: 5000
+  learning_rate: .005
+  min_delta: .00000000008
+  patience: 50
   temperature: 1
   temperature_decay: .9999
   single_epoch_test_run: False
-  which_data: 'disk' # disk or sim
+  which_data: 'sim' # disk or sim
   save_data: False
   nclass: 2
   n_rep: 1 # number of times to fit the model with different starting values
   n_iw_samples: 1
-  N: 1000
-  nitems: 20
-  model: 'gs' #st, gs, vq, dvae or rbm
+  N: 10000
+  nitems: 100
+  emb_dim: 5
+  model: 'gs' #st, gs, vq, dvae, log or rbm

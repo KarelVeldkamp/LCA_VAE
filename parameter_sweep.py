@@ -15,6 +15,7 @@ for line in tqdm(lines):
 
     # Create the command to run main.py with the parameters
     command = ["python", script_name] + parameters
+    print(command)
 
     # Run the command
     subprocess.run(command)

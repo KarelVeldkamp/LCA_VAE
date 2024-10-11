@@ -3,7 +3,7 @@ from torch import nn
 import torch.nn.functional as F
 import torch.nn.utils.prune
 import pytorch_lightning as pl
-
+import torch.distributions as dist
 
 class GumbelSoftmax(pl.LightningModule):
     """
@@ -19,7 +19,7 @@ class GumbelSoftmax(pl.LightningModule):
         # Gumbel distribution
 
         self.G = torch.distributions.Gumbel(0, 1)
-        self.softmax = torch.nn.Softmax(dim=1)
+        self.softmax = torch.nn.Softmax(dim=-1)
         self.temperature = kwargs.get('temperature', None)
         self.temperature_decay = kwargs.get('temperature_decay', None)
 
@@ -29,12 +29,39 @@ class GumbelSoftmax(pl.LightningModule):
         :param log_pi: NxM tensor of log probabilities where N is the batch size and M is the number of classes
         :return: NxM tensor of 'discretized probabilities' the lowe the temperature the more discrete
         """
-        # sample gumbel variable and move to correct device
+        # sample gumbel variable
+
         g = self.G.sample(log_pi.shape)
         g = g.to(log_pi)
         # sample from gumbel softmax
         y = self.softmax((log_pi + g)/self.temperature)
+
+        #self.temperature *= self.temperature_decay
         return y
+
+class LogisticSampler(pl.LightningModule):
+    """
+    Network module that performs the Gumbel-Softmax operation
+    """
+    def __init__(self, **kwargs):
+        """
+        initialize
+        :param temperature: temperature parameter at the start of training
+        :param temperature_decay: factor to multiply temperature by each epoch
+        """
+        super(LogisticSampler, self).__init__()
+
+    def forward(self, log_pi):
+        """
+        forward pass
+        :param log_pi: NxM tensor of log probabilities where N is the batch size and M is the number of classes
+        :return: NxM tensor of 'discretized probabilities' the lowe the temperature the more discrete
+        """
+        pi = F.softmax(log_pi, 1)
+        #z = F.sigmoid((pi-.5)*10000)
+
+        return pi
+
 
 
 class SpikeAndExp(pl.LightningModule):
@@ -51,12 +78,15 @@ class SpikeAndExp(pl.LightningModule):
         q = torch.clamp(q,min=1e-7,max=1.-1e-7)
 
         #this is a tensor of uniformly sampled random number in [0,1)
-        rho = torch.rand(q.size())
-        zero_mask = torch.zeros(q.size())
-        ones = torch.ones(q.size())
+        rho = torch.rand(q.size()).to(q)
+        zero_mask = torch.zeros(q.size()).to(q)
+        ones = torch.ones(q.size()).to(q)
+        beta = self.beta.to(q)
+
 
         # inverse CDF
-        conditional_log = (1./self.beta)*torch.log(((rho+q-ones)/q)*(self.beta.exp()-1)+ones)
+
+        conditional_log = (1./beta)*torch.log(((rho+q-ones)/q)*(beta.exp()-1)+ones)
 
         zeta=torch.where(rho >= 1 - q, conditional_log, zero_mask)
         return zeta
@@ -204,8 +234,8 @@ class Encoder(pl.LightningModule):
         super(Encoder, self).__init__()
 
         self.dense1 = nn.Linear(nitems, hidden_layer_size)
-        self.dense2 = nn.Linear(hidden_layer_size, hidden_layer_size)
-        self.dense3 = nn.Linear(hidden_layer_size, nclass)
+        self.dense2 = nn.Linear(hidden_layer_size, nclass)
+
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """
@@ -216,10 +246,9 @@ class Encoder(pl.LightningModule):
         """
 
         # calculate s and mu based on encoder weights
-        out = F.elu(self.dense1(x))
-        out = F.elu(self.dense2(out))
-        pi = self.dense3(out)
-        return pi
+        out = F.sigmoid(self.dense1(x))
+        out = self.dense2(out)
+        return out
 
 
 class Decoder(pl.LightningModule):
@@ -236,9 +265,9 @@ class Decoder(pl.LightningModule):
         super().__init__()
 
         # initialise netowrk components
-        self.linear = nn.Linear(kwargs.get('nclass', None), 5, bias=True)
-        self.linear2 = nn.Linear(5, 10, bias=True)
-        self.linear3 = nn.Linear(10, nitems, bias=True)
+        self.linear = nn.Linear(kwargs.get('nclass', None), nitems, bias=True)
+        #self.linear2 = nn.Linear(nitems//2, nitems//2, bias=True)
+        #self.linear3 = nn.Linear(nitems//2, nitems, bias=True)
         self.activation = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -248,9 +277,9 @@ class Decoder(pl.LightningModule):
         :param m: mask representing which data is missing
         :return: tensor representing reconstructed item responses
         """
-        out = F.relu(self.linear(x))
-        out = F.relu(self.linear2(out))
-        out = self.linear3(out)
+        out = self.linear(x)
+        #out = F.relu(self.linear2(out))
+        #out = self.linear3(out)
         out = self.activation(out)
         return out
 
@@ -268,9 +297,9 @@ class VQDecoder(pl.LightningModule):
         super().__init__()
         emb_dim = kwargs.get('emb_dim', None)
         # initialise netowrk components
-        self.linear = nn.Linear(emb_dim, emb_dim*2, bias=True)
-        self.linear2 = nn.Linear(emb_dim*2, emb_dim*2, bias=True)
-        self.linear3 = nn.Linear(emb_dim*2, nitems, bias=True)
+        self.linear = nn.Linear(emb_dim, nitems//2, bias=True)
+        self.linear2 = nn.Linear(nitems//2, nitems//2, bias=True)
+        self.linear3 = nn.Linear(nitems//2, nitems, bias=True)
         self.activation = nn.Sigmoid()
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -280,22 +309,23 @@ class VQDecoder(pl.LightningModule):
         :param m: mask representing which data is missing
         :return: tensor representing reconstructed item responses
         """
-        out = F.relu(self.linear(x))
-        out = F.relu(self.linear2(out))
+        out = F.elu(self.linear(x))
+        out = F.elu(self.linear2(out))
         out = self.linear3(out)
         out = self.activation(out)
         return out
 
-
 SAMPLERS = {'dvae': SpikeAndExp,
             'gs': GumbelSoftmax,
             'vq': VectorQuantizer,
-            'st': StraightThroughSampler}
+            'st': StraightThroughSampler,
+            'log': LogisticSampler}
 
 DECODERS = {'dvae': Decoder,
             'gs': Decoder,
             'vq': VQDecoder,
-            'st': Decoder}
+            'st': Decoder,
+            'log': Decoder}
 
 
 class VAE(pl.LightningModule):
@@ -308,6 +338,7 @@ class VAE(pl.LightningModule):
                  hidden_layer_size: int,
                  learning_rate: float,
                  sampler_type: str,
+                 n_iw_samples: int =1,
                  **kwargs):
         """
         init
@@ -324,22 +355,23 @@ class VAE(pl.LightningModule):
         self.dataloader = dataloader
 
         if sampler_type == 'vq':
-            latent_dims = kwargs.get('emb_dim', None)
+            self.latent_dims = kwargs.get('emb_dim', None)
         else:
-            latent_dims = kwargs.get('nclass')
+            self.latent_dims = kwargs.get('nclass')
         self.encoder = Encoder(nitems,
-                               latent_dims,
+                               self.latent_dims,
                                hidden_layer_size
         )
 
         self.sampler = SAMPLERS[sampler_type](**kwargs)
-        self.Softmax = nn.Softmax(dim=1)
+        self.Softmax = nn.Softmax(dim=-1)
 
         self.decoder = DECODERS[sampler_type](nitems, **kwargs)
 
         self.lr = learning_rate
         self.kl=0
         self.sampler_type = sampler_type
+        self.n_samples = n_iw_samples
 
     def forward(self, x: torch.Tensor, m: torch.Tensor=None):
         """
@@ -350,22 +382,17 @@ class VAE(pl.LightningModule):
         """
 
         log_pi = self.encoder(x)
+        log_pi = log_pi.expand(self.n_samples, *log_pi.shape)
 
-        zeta = self.sampler(log_pi.exp())
+        zeta = self.sampler(log_pi)
+
 
         reco = self.decoder(zeta)
+        # Calculate the estimated probabilities
+        pi = self.Softmax(log_pi)
 
 
-        if self.sampler_type == 'vq':
-            self.kl = self.sampler.vq_loss
-        else:
-            # Calculate the estimated probabilities
-            pi = self.Softmax(log_pi)
-            # calculate kl divergence
-            log_ratio = torch.log(pi * 2 + 1e-20)
-            self.kl = torch.sum(pi * log_ratio, dim=-1).mean()
-
-        return reco
+        return reco, pi, zeta
 
     def configure_optimizers(self):
         return torch.optim.Adam(self.parameters(), lr=self.lr, amsgrad=True)
@@ -374,17 +401,59 @@ class VAE(pl.LightningModule):
         # forward pass
 
         data = batch
-        X_hat = self(data)
-        bce = torch.nn.functional.binary_cross_entropy(X_hat, batch, reduction='none')
-        bce = torch.mean(bce) * self.nitems
+        X_hat, pi, z = self(data)
 
-        loss = bce + torch.sum(self.kl)
-        self.log('train_loss',loss)
+
+        pi = pi.unsqueeze(2)
+        z = z.unsqueeze(2)
+
+        loss = self.loss(data, X_hat, pi, z)
 
         return {'loss': loss}
 
     def train_dataloader(self):
         return self.dataloader
+
+    def loss(self, input, reco, pi, z):
+        # calculate log likelihood
+        lll = ((input * reco).clamp(1e-7).log() + ((1 - input) * (1 - reco)).clamp(1e-7).log()).sum(-1, keepdim=True)
+
+        if self.sampler_type == 'vq':
+            kl = self.sampler.vq_loss
+            loss = (-lll + kl).mean()
+        else:
+            kl_type = 'categorical'
+            if kl_type == 'categorical':
+                # calculate kl divergence
+                log_ratio = torch.log(pi * self.latent_dims + 1e-7)
+                kl = torch.sum(pi * log_ratio, dim=-1)
+
+                loss = (-lll + kl).mean()
+            elif kl_type == 'concrete':
+                log_p_theta = dist.RelaxedOneHotCategorical(torch.Tensor([self.sampler.temperature]),
+                                                            probs=torch.ones_like(pi)).log_prob(z).sum(-1, keepdim=True)
+
+                log_q_theta_x = dist.RelaxedOneHotCategorical(torch.Tensor([self.sampler.temperature]),
+                                                              probs=pi).log_prob(z).sum(-1, keepdim=True)
+
+                kl = (log_q_theta_x - log_p_theta)  # kl divergence
+
+
+                # combine into ELBO
+                elbo = lll - kl
+
+                with torch.no_grad():
+                    weight = (elbo - elbo.logsumexp(dim=0)).exp()
+                #
+                loss = (-weight * elbo).sum(0).mean()
+        self.log('train_loss', loss)
+        if self.sampler_type == 'gs':
+            self.sampler.temperature *= self.sampler.temperature_decay
+        return loss
+
+
+
+
 
 
 
@@ -393,7 +462,7 @@ class RestrictedBoltzmannMachine(pl.LightningModule):
     def __init__(self, dataloader, n_visible, n_hidden, learning_rate, n_gibbs):
         super(RestrictedBoltzmannMachine, self).__init__()
         # true
-        self.W = torch.nn.Parameter(torch.randn(n_visible, n_hidden))
+        self.W = torch.nn.Parameter(torch.randn(n_visible, n_hidden)*0.01)
         self.b_hidden = torch.nn.Parameter(torch.zeros(n_hidden))
         self.b_visible = torch.nn.Parameter(torch.zeros(n_visible))
 
