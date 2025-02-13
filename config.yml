@@ -3,17 +3,18 @@ configs:
   batch_size: 1000
   gibbs_samples: 1
   max_epochs: 5000
-  learning_rate: .005
+  learning_rate: .0005
   min_delta: .00000000008
   patience: 50
   temperature: 1
-  temperature_decay: .9999
+  temperature_decay: .99
+  gumbel_min_temp: .3
   single_epoch_test_run: False
   which_data: 'sim' # disk or sim
   save_data: False
-  nclass: 2
+  nclass: 8
   n_rep: 1 # number of times to fit the model with different starting values
-  n_iw_samples: 1
+  n_iw_samples: 2
   N: 10000
   nitems: 100
   emb_dim: 5

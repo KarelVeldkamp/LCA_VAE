@@ -29,15 +29,20 @@ class GumbelSoftmax(pl.LightningModule):
         :param log_pi: NxM tensor of log probabilities where N is the batch size and M is the number of classes
         :return: NxM tensor of 'discretized probabilities' the lowe the temperature the more discrete
         """
-        # sample gumbel variable
+        # # sample gumbel variable
+        # dist = torch.distributions.RelaxedOneHotCategorical(self.temperature, logits=log_pi)
+        # y = dist.rsample()
+        #
+        # assert torch.allclose(y.sum(-1), torch.ones_like(y.sum(-1)), atol=1e-3), "Samples don't sum to 1"
 
         g = self.G.sample(log_pi.shape)
         g = g.to(log_pi)
         # sample from gumbel softmax
         y = self.softmax((log_pi + g)/self.temperature)
 
-        #self.temperature *= self.temperature_decay
         return y
+
+
 
 class LogisticSampler(pl.LightningModule):
     """
@@ -204,10 +209,10 @@ class VectorQuantizer(nn.Module):
         # compute the distances between the encoder outputs and the embeddings
         dist_mat = torch.cdist(ze, self.embeddings.weight.clone(), p=2)
         # select closest embedding for each person
+        emb_ix = torch.argmin(dist_mat, dim=2)
 
-        emb_ix = torch.argmin(dist_mat, dim=1)
         zq = self.embeddings(emb_ix)
-
+        #ze = ze.squeeze()
         self.vq_loss = F.mse_loss(zq.detach(), ze) + F.mse_loss(zq, ze.detach())
 
         zq = ze + (zq-ze).detach()
@@ -338,6 +343,7 @@ class VAE(pl.LightningModule):
                  hidden_layer_size: int,
                  learning_rate: float,
                  sampler_type: str,
+                 min_temp: float,
                  n_iw_samples: int =1,
                  **kwargs):
         """
@@ -372,6 +378,7 @@ class VAE(pl.LightningModule):
         self.kl=0
         self.sampler_type = sampler_type
         self.n_samples = n_iw_samples
+        self.min_temp = min_temp
 
     def forward(self, x: torch.Tensor, m: torch.Tensor=None):
         """
@@ -382,16 +389,14 @@ class VAE(pl.LightningModule):
         """
 
         log_pi = self.encoder(x)
-        log_pi = log_pi.expand(self.n_samples, *log_pi.shape)
+
+        log_pi = log_pi.repeat(self.n_samples, 1,1)
 
         zeta = self.sampler(log_pi)
-
 
         reco = self.decoder(zeta)
         # Calculate the estimated probabilities
         pi = self.Softmax(log_pi)
-
-
         return reco, pi, zeta
 
     def configure_optimizers(self):
@@ -407,7 +412,8 @@ class VAE(pl.LightningModule):
         pi = pi.unsqueeze(2)
         z = z.unsqueeze(2)
 
-        loss = self.loss(data, X_hat, pi, z)
+        loss, _ = self.loss(data, X_hat, pi, z)
+        self.log('train_loss', loss)
 
         return {'loss': loss}
 
@@ -416,13 +422,14 @@ class VAE(pl.LightningModule):
 
     def loss(self, input, reco, pi, z):
         # calculate log likelihood
+
         lll = ((input * reco).clamp(1e-7).log() + ((1 - input) * (1 - reco)).clamp(1e-7).log()).sum(-1, keepdim=True)
 
         if self.sampler_type == 'vq':
             kl = self.sampler.vq_loss
             loss = (-lll + kl).mean()
         else:
-            kl_type = 'categorical'
+            kl_type = 'concrete'
             if kl_type == 'categorical':
                 # calculate kl divergence
                 log_ratio = torch.log(pi * self.latent_dims + 1e-7)
@@ -430,30 +437,74 @@ class VAE(pl.LightningModule):
 
                 loss = (-lll + kl).mean()
             elif kl_type == 'concrete':
+                unif_probs = torch.full_like(pi, 1.0 / pi.shape[-1])
+
+                z = torch.clamp(z, min=1e-8)  # Ensure strictly positive
+                z = z / z.sum(-1, keepdim=True)  # Re-normalize for numerical safety
+
                 log_p_theta = dist.RelaxedOneHotCategorical(torch.Tensor([self.sampler.temperature]),
-                                                            probs=torch.ones_like(pi)).log_prob(z).sum(-1, keepdim=True)
+                                                            probs=unif_probs).log_prob(z).sum(-1, keepdim=True)
 
                 log_q_theta_x = dist.RelaxedOneHotCategorical(torch.Tensor([self.sampler.temperature]),
                                                               probs=pi).log_prob(z).sum(-1, keepdim=True)
 
                 kl = (log_q_theta_x - log_p_theta)  # kl divergence
 
-
                 # combine into ELBO
+
                 elbo = lll - kl
+
 
                 with torch.no_grad():
                     weight = (elbo - elbo.logsumexp(dim=0)).exp()
-                #
+                    #if z.requires_grad:
+                     #   z.register_hook(lambda grad: (weight * grad).float())
+
+
                 loss = (-weight * elbo).sum(0).mean()
-        self.log('train_loss', loss)
+
+
+        return loss, weight
+
+    def on_train_epoch_end(self):
         if self.sampler_type == 'gs':
-            self.sampler.temperature *= self.sampler.temperature_decay
-        return loss
+            self.sampler.temperature = max(self.sampler.temperature * self.sampler.temperature_decay, self.min_temp)
+
+    def fscores(self, batch, n_mc_samples=50):
+        data = batch
+
+        if self.n_samples == 1:
+            mu = self.sampler.softmax(self.encoder(data))[:, :, 0]
+            return mu.unsqueeze(0)
+        else:
+
+            scores = torch.empty((n_mc_samples, data.shape[0], self.latent_dims))
+            for i in range(n_mc_samples):
+
+                reco, pi, z = self(data)
+                print('c')
+
+                loss, weight = self.loss(data, reco, pi.unsqueeze(2), z.unsqueeze(2))
+                #z = z[:, :, :, 0]
+
+                idxs = torch.distributions.Categorical(probs=weight.permute(1, 2, 0)).sample()
+
+                # Reshape idxs to match the dimensions required by gather
+                # Ensure idxs is of the correct type
+                idxs = idxs.long()
+
+                # Expand idxs to match the dimensions required for gather
+                idxs_expanded = idxs.unsqueeze(-1).expand(-1, -1, z.size(2))  # Shape [10000, 1, 3]
 
 
+                # Use gather to select the appropriate elements from z
+                output = torch.gather(z.transpose(0, 1), 1,
+                                      idxs_expanded).squeeze().detach()  # Shape [10000, latent dims]
 
 
+                scores[i, :, :] = output
+
+            return scores
 
 
 

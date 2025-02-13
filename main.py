@@ -22,10 +22,13 @@ with open("./config.yml", "r") as f:
 # potentially overwrite configurations with command line arguments
 if len(sys.argv) > 1:
     cfg['model'] = sys.argv[1]
-    cfg['learning_rate'] = float(sys.argv[2])
-    cfg['temperature_decay'] = float(sys.argv[3])
+    cfg['nclass'] = int(sys.argv[2])
+    cfg['N'] = int(sys.argv[3])
     iteration = int(sys.argv[4])
-    cfg['n_rep'] = int(sys.argv[5])
+    cfg['nitems'] = int(sys.argv[5])
+    cfg['n_iw_samples'] = int(sys.argv[6])
+    cfg['emb_dim'] = int(sys.argv[7])
+    cfg['n_rep'] = int(sys.argv[8])
 else:
     iteration = 1
 
@@ -45,13 +48,13 @@ if cfg['which_data'] == 'sim':
     # Iterate over each row
     for i in range(nclass):
         # Randomly choose the number of entries to set to one between 50 and 100
-        num_ones = int(nitems * 0.15) #np.random.randint(50, 80)
+        num_ones = int(nitems * 0.9) #np.random.randint(50, 80)
 
         # Randomly select num_ones indices to set to one
         indices = np.random.choice(nitems, num_ones, replace=False)
 
         # Set the selected indices to one
-        cond_probs[i, indices] += .20#np.random.uniform(.1,.25, num_ones)
+        cond_probs[i, indices] = np.random.uniform(.1,.9, num_ones)#+= .20#
 
     # Generate true class membership for each person
     true_class_ix = np.random.choice(np.arange(nclass), size=(N,), p=class_probs)
@@ -64,20 +67,22 @@ if cfg['which_data'] == 'sim':
 
 
     if cfg['save_data']:
-        np.savetxt(f'true/data/data_{cfg["nclass"]}_{iteration}.csv', data,  delimiter=',')
-        np.savetxt(f'true/parameters/class_{cfg["nclass"]}_{iteration}.csv', true_class, delimiter=',')
-        np.savetxt(f'true/parameters/probs_{cfg["nclass"]}_{iteration}.csv', cond_probs, delimiter=',')
+        np.savetxt(f'true/data/data_{cfg["nclass"]}_{cfg["N"]}_{iteration}_{cfg["nitems"]}.csv', data,  delimiter=',')
+        np.savetxt(f'true/parameters/class_{cfg["nclass"]}_{cfg["N"]}_{iteration}_{cfg["nitems"]}.csv', true_class, delimiter=',')
+        np.savetxt(f'true/parameters/probs_{cfg["nclass"]}_{cfg["N"]}_{iteration}_{cfg["nitems"]}.csv', cond_probs, delimiter=',')
         sys.exit()
 elif cfg['which_data'] == 'disk':
-    data = genfromtxt(f'true/data/data_{cfg["nclass"]}_{iteration}.csv', delimiter=',')
-    cond_probs = genfromtxt(f'true/parameters/probs_{cfg["nclass"]}_{iteration}.csv', delimiter=',')
-    true_class = genfromtxt(f'true/parameters/class_{cfg["nclass"]}_{iteration}.csv', delimiter=',')
+    data = genfromtxt(f'true/data/data_{cfg["nclass"]}_{cfg["N"]}_{iteration}_{cfg["nitems"]}.csv', delimiter=',')
+    cond_probs = genfromtxt(f'true/parameters/probs_{cfg["nclass"]}_{cfg["N"]}_{iteration}_{cfg["nitems"]}.csv', delimiter=',')
+    true_class = genfromtxt(f'true/parameters/class_{cfg["nclass"]}_{cfg["N"]}_{iteration}_{cfg["nitems"]}.csv', delimiter=',')
 
     true_class_ix = np.argmax(true_class, 1)
 else:
     raise ValueError('Unknown value for which_data')
 
-
+np.savetxt('/Users/karel/Downloads/lcadata.csv', data, delimiter=',')
+np.savetxt('/Users/karel/Downloads/lcaclass.csv', true_class, delimiter=',')
+np.savetxt('/Users/karel/Downloads/lcaprobs.csv', cond_probs, delimiter=',')
 # create pytorch dataset
 dataset = MemoryDataset(data)
 train_loader = DataLoader(dataset, batch_size=cfg['batch_size'], shuffle=True)
@@ -90,13 +95,14 @@ for i in range(cfg['n_rep']):
         model = VAE(dataloader=train_loader,
                     nitems=cfg['nitems'],
                     nclass=cfg['nclass'],
-                    hidden_layer_size=(cfg['nitems']+cfg['nclass'])//2,
+                    hidden_layer_size=50,#(cfg['nitems']+cfg['nclass'])//2,
                     learning_rate=cfg['learning_rate'],
                     emb_dim=cfg['emb_dim'],
                     beta=1,
                     temperature=cfg['temperature'],
                     temperature_decay=cfg['temperature_decay'],
                     sampler_type=cfg['model'],
+                    min_temp=cfg['gumbel_min_temp'],
                     n_iw_samples=cfg['n_iw_samples'])
     elif cfg['model'] == 'rbm':
         nnodes = np.log2(cfg['nclass'])
@@ -134,12 +140,18 @@ for i in range(cfg['n_rep']):
     runtime = time.time() - start
     print(f'runtime: {runtime}')
 
+    print(model.sampler.temperature)
+
     # compute the estimated conditional probabilities and the posterior probabilities on the test data
     test_data = next(iter(test_loader))
     if cfg['model'] in ['gs', 'log']:
         log_pi = model.encoder(test_data)
-        pred_class = model.sampler(log_pi.exp()).detach().numpy()
+        #pred_class = model.sampler(log_pi.exp()).detach().numpy()
+        #pred_class_ix = np.argmax(pred_class, 1)
+
+        pred_class = model.fscores(torch.Tensor(data)).mean(0).detach().numpy()
         pred_class_ix = np.argmax(pred_class, 1)
+
 
         # get the conditional probabilities
         est_probs = model.decoder(torch.eye(cfg['nclass'])).detach().numpy()
